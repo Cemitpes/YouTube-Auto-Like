@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube Auto Like
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
-// @description  Automatically like a YouTube video or Shorts based on URL, if subscribed and not already liked.
+// @version      1.4.0
+// @description  Automatically like YouTube videos and Shorts if subscribed and not already liked.
 // @author       Your Name
 // @match        https://www.youtube.com/*
 // @grant        none
@@ -11,164 +11,153 @@
 (function () {
     'use strict';
 
-    const RETRY_INTERVAL = 500; // 모든 인터벌을 500ms로 통일
-    let lastVideoId = null; // 마지막으로 확인된 비디오 ID
+    // Debugging options
+    const DEBUG = true; // Enable or disable logging globally
+    const DEBUG_LEVEL = 3; // 0 = None, 1 = Errors only, 2 = Warnings and Errors, 3 = All logs
 
-    /**
-     * 특정 요소를 대기하여 처리
-     * @param {string} selector - CSS 선택자
-     * @param {function} callback - 요소가 로드된 후 실행될 함수
-     * @param {number} interval - 검색 주기 (ms)
-     * @param {number} timeout - 최대 대기 시간 (ms)
-     */
-    function waitForElement(selector, callback, interval = RETRY_INTERVAL, timeout = 10000) {
+    // Log utility function
+    const log = (message, level = 3, type = 'log') => {
+        if (DEBUG && level <= DEBUG_LEVEL && console[type]) {
+            const styles = {
+                log: 'color: blue;',
+                info: 'color: green;',
+                warn: 'color: orange;',
+                error: 'color: red; font-weight: bold;',
+            };
+            console[type](`%c[YouTube Auto Like] ${message}`, styles[type] || '');
+        }
+    };
+
+    // Constants
+    const RETRY_INTERVAL = 500;
+    const TIMEOUT = 10000;
+    const SELECTORS = {
+        LIKE_BUTTON: 'like-button-view-model button',
+        SUBSCRIBE_BUTTON: '#subscribe-button-shape yt-touch-feedback-shape .yt-spec-touch-feedback-shape--touch-response',
+        SHORTS: '.ytShortsVideoTitleViewModelShortsVideoTitle',
+        SHORTS_LIKE_BUTTON: 'ytd-reel-video-renderer[is-active] #like-button button',
+        SHORTS_SUBSCRIBE_BUTTON: 'ytd-reel-video-renderer[is-active] .ytReelChannelBarViewModelReelSubscribeButton'
+    };
+
+    // Utility: Wait for elements
+    const waitForElements = (selectors, callback, interval = RETRY_INTERVAL, timeout = TIMEOUT) => {
+        if (!Array.isArray(selectors)) {
+            selectors = [selectors];
+        }
+
         const startTime = Date.now();
         const timer = setInterval(() => {
-            const element = document.querySelector(selector);
-            if (element) {
+            const elements = selectors.map(selector => document.querySelector(selector)).filter(Boolean);
+
+            if (elements.length === selectors.length) {
                 clearInterval(timer);
-                callback(element);
+                callback(elements);
             } else if (Date.now() - startTime > timeout) {
                 clearInterval(timer);
-                console.error(`시간 초과: 선택자 "${selector}"를 찾을 수 없습니다.`);
+                log(`Timeout: Cannot find all selectors "${selectors.join(', ')}".`, 1, 'error');
             }
         }, interval);
-    }
+    };
 
-    /**
-     * 일반 비디오: 좋아요 로직 실행 및 변경 감지
-     */
-    function likeVideo() {
-        const likeButton = document.querySelector('like-button-view-model button');
+    // Observe button state changes
+    const observeButton = (likeSelector, subscribeSelector, isShorts, message) => {
+        const likeButton = document.querySelector(likeSelector);
         if (!likeButton) {
-            console.log(`[Info] 좋아요 버튼을 찾을 수 없습니다. ${RETRY_INTERVAL}ms 후 재시도합니다.`);
-            setTimeout(likeVideo, RETRY_INTERVAL);
+            log('Like button not found for observation.', 1, 'error');
             return;
         }
 
         const observer = new MutationObserver(() => {
-            if (likeButton.getAttribute('aria-pressed') === 'false') {
-                console.log('[Info] 좋아요가 취소되었습니다. 다시 누릅니다.');
-                likeButton.click();
-                console.log('[Info] 좋아요 버튼을 다시 눌렀습니다.');
+            const isSubscribed = document.querySelector(subscribeSelector);
+            if (!isSubscribed) {
+                log('Subscribe button not found during observation.', 1, 'error');
+                return;
+            }
+
+            if (isShorts) {
+                if (!isSubscribed.querySelector('yt-subscribe-button-view-model') && likeButton.getAttribute('aria-pressed') === 'false') {
+                    likeButton.click();
+                    log(message, 3, 'info');
+                }
+            } else {
+                if (isSubscribed && likeButton.getAttribute('aria-pressed') === 'false') {
+                    likeButton.click();
+                    log(message, 3, 'info');
+                }
             }
         });
 
         observer.observe(likeButton, { attributes: true, attributeFilter: ['aria-pressed'] });
+    };
 
-        if (likeButton.getAttribute('aria-pressed') === 'false') {
-            console.log('[Info] 좋아요 버튼을 누릅니다.');
-            likeButton.click();
-        } else {
-            console.log('[Info] 이미 좋아요를 누른 상태입니다.');
-        }
-    }
+    // Like content
+    const likeContent = (likeSelector, subscribeSelector, isShorts = false) => {
+        waitForElements([likeSelector, subscribeSelector], () => {
+            const likeButton = document.querySelector(likeSelector);
+            const isSubscribed = document.querySelector(subscribeSelector);
 
-    /**
-     * 쇼츠: 구독 상태 확인 및 좋아요 로직 실행
-     * @param {HTMLElement} currentShort - 활성화된 쇼츠 요소
-     */
-    function checkSubscriptionStatus(currentShort) {
-        const subscribeButton = currentShort.querySelector('.ytReelChannelBarViewModelReelSubscribeButton');
-        if (!subscribeButton) {
-            console.error('구독 버튼을 찾을 수 없습니다.');
-            return;
-        }
-
-        const videoId = currentShort.querySelector("a[href*='/shorts']")?.getAttribute("href").split("/")[2];
-        if (!videoId || videoId === lastVideoId) {
-            console.log('이미 처리된 비디오이거나 ID를 찾을 수 없습니다.');
-            return;
-        }
-
-        lastVideoId = videoId; // 현재 비디오 ID 업데이트
-
-        const isSubscribed = !subscribeButton.querySelector('yt-subscribe-button-view-model');
-        if (isSubscribed) {
-            console.log('구독 상태를 확인했습니다. 좋아요를 누릅니다.');
-            waitForElement('#like-button button', clickLikeButton);
-        } else {
-            console.log('구독하지 않은 채널입니다.');
-        }
-    }
-
-    /**
-     * 쇼츠: 좋아요 버튼 클릭
-     * @param {HTMLElement} likeButton - 좋아요 버튼 요소
-     */
-    function clickLikeButton(likeButton) {
-        if (likeButton && likeButton.getAttribute('aria-pressed') === 'false') {
-            likeButton.click();
-            console.log('좋아요 버튼을 눌렀습니다.');
-        } else {
-            console.log('좋아요 버튼을 이미 눌렀거나 찾을 수 없습니다.');
-        }
-    }
-
-    /**
-     * 쇼츠: 활성화된 쇼츠 반환
-     * @returns {HTMLElement|null} - 활성화된 쇼츠 요소
-     */
-    function getActiveShort() {
-        return document.querySelector('ytd-reel-video-renderer[is-active]');
-    }
-
-    /**
-     * 쇼츠: 변경 감지 및 구독 상태 확인
-     */
-    function observeShortsChange() {
-        const container = document.querySelector('#shorts-container');
-        if (!container) {
-            console.error('쇼츠 컨테이너를 찾을 수 없습니다.');
-            return;
-        }
-
-        const observer = new MutationObserver(() => {
-            setTimeout(() => { // 변경된 쇼츠의 DOM이 완전히 로드된 후 실행
-                const currentShort = getActiveShort();
-                if (currentShort) checkSubscriptionStatus(currentShort);
-            }, RETRY_INTERVAL);
-        });
-
-        observer.observe(container, { childList: true, subtree: true });
-    }
-
-    /**
-     * 페이지 초기화 및 URL 감지
-     */
-    function init() {
-        if (location.href.includes('/shorts/')) {
-            console.log('[Info] 쇼츠 페이지로 감지되었습니다.');
-            waitForElement('#shorts-container', () => {
-                observeShortsChange();
-                const currentShort = getActiveShort();
-                if (currentShort) checkSubscriptionStatus(currentShort);
-            });
-        } else if (location.href.includes('watch?v=')) {
-            console.log('[Info] 일반 비디오 페이지로 감지되었습니다.');
-            likeVideo();
-        } else {
-            console.log('[Info] 비디오 또는 쇼츠 페이지가 아닙니다.');
-        }
-    }
-
-    /**
-     * URL 변경 감지 및 초기화
-     */
-    function observeUrlChange() {
-        let currentUrl = location.href;
-        const observer = new MutationObserver(() => {
-            if (location.href !== currentUrl) {
-                currentUrl = location.href;
-                console.log('[Info] URL이 변경되었습니다. 초기화 중...');
-                init();
+            if (!likeButton || !isSubscribed) {
+                log('Required buttons not found for liking content.', 1, 'error');
+                return;
             }
+
+            if (isShorts) {
+                if (!isSubscribed.querySelector('yt-subscribe-button-view-model') && likeButton.getAttribute('aria-pressed') === 'false') {
+                    likeButton.click();
+                    log('Liked the Shorts content.', 3, 'info');
+                }
+            } else {
+                if (isSubscribed && likeButton.getAttribute('aria-pressed') === 'false') {
+                    likeButton.click();
+                    log('Liked the video content.', 3, 'info');
+                }
+            }
+
+            observeButton(likeSelector, subscribeSelector, isShorts, isShorts ? 'Re-liked the Shorts.' : 'Re-liked the video.');
         });
+    };
 
-        observer.observe(document.body, { childList: true, subtree: true });
-    }
+    // Observe title changes
+    const observeTitleChanges = (callback) => {
+        waitForElements(['title'], () => {
+            const titleElement = document.querySelector('title');
+            if (!titleElement) {
+                log('Title element not found.', 1, 'error');
+                return;
+            }
 
-    // 스크립트 시작
+            let lastTitle = titleElement.innerText;
+            const observer = new MutationObserver(() => {
+                const currentTitle = titleElement.innerText;
+                if (currentTitle !== lastTitle) {
+                    lastTitle = currentTitle;
+                    log(`Title changed to: ${currentTitle}`, 3, 'info');
+                    callback();
+                }
+            });
+
+            observer.observe(titleElement, { subtree: true, characterData: true, childList: true });
+        });
+    };
+
+    // Initialization function
+    const init = () => {
+        try {
+            if (location.href.includes('/shorts/')) {
+                log('Shorts page detected.', 2, 'info');
+                likeContent(SELECTORS.SHORTS_LIKE_BUTTON, SELECTORS.SHORTS_SUBSCRIBE_BUTTON, true);
+            } else if (location.href.includes('watch?v=')) {
+                log('Video page detected.', 2, 'info');
+                likeContent(SELECTORS.LIKE_BUTTON, SELECTORS.SUBSCRIBE_BUTTON, false);
+            } else {
+                log('Not a video or shorts page.', 2, 'warn');
+            }
+        } catch (error) {
+            log(`Initialization failed: ${error.message}`, 1, 'error');
+        }
+    };
+
+    // Start script and observe title changes
     init();
-    observeUrlChange();
+    observeTitleChanges(init);
 })();
